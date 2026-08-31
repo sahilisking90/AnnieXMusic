@@ -31,68 +31,57 @@ _cache_lock = asyncio.Lock()
 _formats_cache: Dict[str, Tuple[float, List[Dict], str]] = {}
 _formats_lock = asyncio.Lock()
 
-# ============ API CONFIGURATION ============
-SHRUTI_API_KEY = "ShrutiBotsUfNnmaiLveTQaPK7FQiC"
-
-# API 1: Primary Shruti API (Direct Download)
-PRIMARY_API_URL = "https://api.shrutibots.site"
-# Endpoint: /download?url={video_id}&type=audio&api_key={KEY}
-# Response: Direct file download
-
-# API 2: Legacy/Fallback API (Token Based)
-FALLBACK_API_URL = "http://13.212.126.0:2020"
-# Endpoint 1: /download?url={video_id}&type=audio -> returns {"download_token": "xxx"}
-# Endpoint 2: /stream/{video_id}?type=audio with header X-Download-Token
-
-# API URLs loaded status
-PRIMARY_API_LOADED = False
-FALLBACK_API_LOADED = False
+# ============ KEY ROTATION API CONFIGURATION ============
+KEY_ROTATOR_URL = "http://100.31.203.71:5000/rotate"
 
 # ============ RATE LIMITING ============
 _request_timestamps = []
 _RATE_LIMIT_WINDOW = 60
 _MAX_REQUESTS_PER_WINDOW = 10
 
-async def load_apis():
-    """Load and verify both APIs"""
-    global PRIMARY_API_LOADED, FALLBACK_API_LOADED
-    logger = LOGGER("ANNIEMUSIC.platforms.Youtube.py")
+# ============ KEY ROTATION MANAGER ============
+class KeyRotator:
+    def __init__(self, url=KEY_ROTATOR_URL):
+        self.url = url
+        self.current_key = None
+        self.key_info = None
     
-    # Check Primary API
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{PRIMARY_API_URL}/", timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status == 200:
-                    PRIMARY_API_LOADED = True
-                    logger.info(f"✅ PRIMARY API URL loaded successfully: {PRIMARY_API_URL}")
-                else:
-                    logger.warning(f"⚠️ Primary API responded with status {response.status}")
-    except Exception as e:
-        logger.warning(f"⚠️ Primary API not accessible: {str(e)}")
+    async def get_key(self) -> Optional[str]:
+        """Get next available API key from rotation manager"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status == 429:
+                        LOGGER("ANNIEMUSIC.platforms.Youtube").warning("⏰ All keys exhausted! Waiting...")
+                        await asyncio.sleep(10)
+                        return None
+                    if response.status == 200:
+                        data = await response.json()
+                        self.current_key = data.get("key_value")
+                        self.key_info = data
+                        LOGGER("ANNIEMUSIC.platforms.Youtube").info(f"🔑 Got key: {self.current_key[:8]}... (Remaining: {data.get('remaining', 0)})")
+                        return self.current_key
+                    return None
+        except Exception as e:
+            LOGGER("ANNIEMUSIC.platforms.Youtube").error(f"❌ Key rotator error: {e}")
+            return None
     
-    # Check Fallback API
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{FALLBACK_API_URL}/", timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status == 200:
-                    FALLBACK_API_LOADED = True
-                    logger.info(f"✅ FALLBACK API URL loaded successfully: {FALLBACK_API_URL}")
-                else:
-                    logger.warning(f"⚠️ Fallback API responded with status {response.status}")
-    except Exception as e:
-        logger.warning(f"⚠️ Fallback API not accessible: {str(e)}")
+    async def get_key_with_retry(self, max_retries=3) -> Optional[str]:
+        """Get key with retry logic"""
+        for attempt in range(max_retries):
+            key = await self.get_key()
+            if key:
+                return key
+            LOGGER("ANNIEMUSIC.platforms.Youtube").info(f"🔄 Key retry {attempt+1}/{max_retries}")
+            await asyncio.sleep(2)
+        return None
     
-    return PRIMARY_API_LOADED, FALLBACK_API_LOADED
+    def get_info(self) -> dict:
+        """Get current key info"""
+        return self.key_info or {"error": "No key used yet"}
 
-# Initialize APIs on startup
-try:
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        asyncio.create_task(load_apis())
-    else:
-        loop.run_until_complete(load_apis())
-except RuntimeError:
-    pass
+# Initialize Key Rotator
+key_rotator = KeyRotator()
 
 def _cookiefile_path() -> Optional[str]:
     path = str(COOKIE_PATH)
@@ -128,221 +117,7 @@ def _check_rate_limit():
         _request_timestamps = []
     _request_timestamps.append(now)
 
-# ============ API 1: PRIMARY SHRUTI API (DIRECT DOWNLOAD) ============
-async def download_song_primary_api(link: str) -> str:
-    """Primary Shruti API - Direct download with API key"""
-    video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
-
-    if not video_id or len(video_id) < 3:
-        return None
-
-    DOWNLOAD_DIR = "downloads"
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
-
-    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-        return file_path
-
-    try:
-        print(f"🔄 Trying Primary API (Direct): {PRIMARY_API_URL}")
-
-        async with aiohttp.ClientSession() as session:
-            params = {"url": video_id, "type": "audio", "api_key": SHRUTI_API_KEY}
-            
-            async with session.get(
-                f"{PRIMARY_API_URL}/download",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=120)
-            ) as response:
-                if response.status != 200:
-                    print(f"⚠️ Primary API returned status {response.status}")
-                    return None
-
-                with open(file_path, "wb") as f:
-                    async for chunk in response.content.iter_chunked(131072):
-                        f.write(chunk)
-                
-                if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                    print(f"✅ Audio downloaded via Primary API")
-                    return file_path
-                return None
-
-    except Exception as e:
-        print(f"❌ Primary API error: {str(e)}")
-        return None
-
-
-async def download_video_primary_api(link: str) -> str:
-    """Primary Shruti API - Video download with API key"""
-    video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
-
-    if not video_id or len(video_id) < 3:
-        return None
-
-    DOWNLOAD_DIR = "downloads"
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp4")
-
-    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-        return file_path
-
-    try:
-        print(f"🔄 Trying Primary API (Direct): {PRIMARY_API_URL}")
-
-        async with aiohttp.ClientSession() as session:
-            params = {"url": video_id, "type": "video", "api_key": SHRUTI_API_KEY}
-            
-            async with session.get(
-                f"{PRIMARY_API_URL}/download",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=180)
-            ) as response:
-                if response.status != 200:
-                    print(f"⚠️ Primary API returned status {response.status}")
-                    return None
-
-                with open(file_path, "wb") as f:
-                    async for chunk in response.content.iter_chunked(131072):
-                        f.write(chunk)
-                
-                if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                    print(f"✅ Video downloaded via Primary API")
-                    return file_path
-                return None
-
-    except Exception as e:
-        print(f"❌ Primary API error: {str(e)}")
-        return None
-
-
-# ============ API 2: LEGACY/FALLBACK API (TOKEN BASED) ============
-async def download_song_fallback_api(link: str) -> str:
-    """Legacy/Fallback API - Token based download"""
-    video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
-
-    if not video_id or len(video_id) < 3:
-        return None
-
-    DOWNLOAD_DIR = "downloads"
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
-
-    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-        return file_path
-
-    try:
-        print(f"🔄 Trying Fallback API (Token): {FALLBACK_API_URL}")
-
-        async with aiohttp.ClientSession() as session:
-            # Step 1: Get download token
-            params = {"url": video_id, "type": "audio"}
-            
-            async with session.get(
-                f"{FALLBACK_API_URL}/download",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as response:
-                if response.status != 200:
-                    print(f"⚠️ Fallback API returned status {response.status}")
-                    return None
-
-                data = await response.json()
-                download_token = data.get("download_token")
-                
-                if not download_token:
-                    print("⚠️ No download token received from Fallback API")
-                    return None
-            
-            # Step 2: Download using token
-            stream_url = f"{FALLBACK_API_URL}/stream/{video_id}?type=audio"
-            
-            async with session.get(
-                stream_url,
-                headers={"X-Download-Token": download_token},
-                timeout=aiohttp.ClientTimeout(total=300)
-            ) as file_response:
-                if file_response.status != 200:
-                    print(f"⚠️ Fallback stream returned status {file_response.status}")
-                    return None
-                
-                with open(file_path, "wb") as f:
-                    async for chunk in file_response.content.iter_chunked(16384):
-                        f.write(chunk)
-                
-                if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                    print(f"✅ Audio downloaded via Fallback API")
-                    return file_path
-                return None
-
-    except Exception as e:
-        print(f"❌ Fallback API error: {str(e)}")
-        return None
-
-
-async def download_video_fallback_api(link: str) -> str:
-    """Legacy/Fallback API - Video download with token"""
-    video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
-
-    if not video_id or len(video_id) < 3:
-        return None
-
-    DOWNLOAD_DIR = "downloads"
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp4")
-
-    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-        return file_path
-
-    try:
-        print(f"🔄 Trying Fallback API (Token): {FALLBACK_API_URL}")
-
-        async with aiohttp.ClientSession() as session:
-            # Step 1: Get download token
-            params = {"url": video_id, "type": "video"}
-            
-            async with session.get(
-                f"{FALLBACK_API_URL}/download",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as response:
-                if response.status != 200:
-                    print(f"⚠️ Fallback API returned status {response.status}")
-                    return None
-
-                data = await response.json()
-                download_token = data.get("download_token")
-                
-                if not download_token:
-                    print("⚠️ No download token received from Fallback API")
-                    return None
-            
-            # Step 2: Download using token
-            stream_url = f"{FALLBACK_API_URL}/stream/{video_id}?type=video"
-            
-            async with session.get(
-                stream_url,
-                headers={"X-Download-Token": download_token},
-                timeout=aiohttp.ClientTimeout(total=600)
-            ) as file_response:
-                if file_response.status != 200:
-                    print(f"⚠️ Fallback stream returned status {file_response.status}")
-                    return None
-                
-                with open(file_path, "wb") as f:
-                    async for chunk in file_response.content.iter_chunked(16384):
-                        f.write(chunk)
-                
-                if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                    print(f"✅ Video downloaded via Fallback API")
-                    return file_path
-                return None
-
-    except Exception as e:
-        print(f"❌ Fallback API error: {str(e)}")
-        return None
-
-
-# ============ YT-DLP FALLBACK ============
+# ============ YT-DLP DOWNLOAD FUNCTIONS ============
 async def download_video_ytdlp(link: str) -> str:
     """Download video using yt-dlp directly"""
     video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
@@ -409,7 +184,6 @@ async def download_video_ytdlp(link: str) -> str:
     except Exception as e:
         return None
 
-
 async def download_audio_ytdlp(link: str) -> str:
     """Download audio using yt-dlp directly"""
     video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
@@ -421,7 +195,7 @@ async def download_audio_ytdlp(link: str) -> str:
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.webm")
 
-    if os.path.exists(file_path):
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 10240:
         return file_path
 
     _check_rate_limit()
@@ -481,31 +255,23 @@ async def download_audio_ytdlp(link: str) -> str:
     except Exception as e:
         return None
 
-
-# ============ MAIN DOWNLOAD FUNCTIONS (API1 -> API2 -> YTDLP) ============
+# ============ MAIN DOWNLOAD FUNCTIONS ============
 async def download_audio(link: str) -> str:
-    """
-    Main audio download - Primary API -> Fallback API -> yt-dlp
-    """
-    # 1. TRY PRIMARY API FIRST
-    print("🎵 Audio Download - Trying Primary API (Direct)...")
-    result = await download_song_primary_api(link)
-    if result:
-        print("✅ Audio: Primary API Success")
-        return result
+    """Download audio using yt-dlp"""
+    video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
+    DOWNLOAD_DIR = "downloads"
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.webm")
+
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 10240:
+        LOGGER("ANNIEMUSIC.platforms.Youtube").info("✅ Audio cache found")
+        return file_path
+
+    LOGGER("ANNIEMUSIC.platforms.Youtube").info("🎵 Downloading audio...")
     
-    # 2. TRY FALLBACK API (TOKEN BASED)
-    print("🔄 Audio - Primary failed, trying Fallback API (Token)...")
-    result = await download_song_fallback_api(link)
-    if result:
-        print("✅ Audio: Fallback API Success")
-        return result
-    
-    # 3. TRY YT-DLP AS LAST RESORT
-    print("🔄 Audio - Both APIs failed, trying yt-dlp fallback...")
     result = await download_audio_ytdlp(link)
     if result:
-        print("✅ Audio: yt-dlp Success")
+        LOGGER("ANNIEMUSIC.platforms.Youtube").info("✅ Audio: yt-dlp Success")
         if result.endswith('.webm'):
             mp3_path = result.replace('.webm', '.mp3')
             try:
@@ -515,38 +281,29 @@ async def download_audio(link: str) -> str:
                 return result
         return result
     
-    print("❌ All audio download methods failed")
+    LOGGER("ANNIEMUSIC.platforms.Youtube").error("❌ All audio download methods failed")
     return None
-
 
 async def download_video(link: str) -> str:
-    """
-    Main video download - Primary API -> Fallback API -> yt-dlp
-    """
-    # 1. TRY PRIMARY API FIRST
-    print("🎬 Video Download - Trying Primary API (Direct)...")
-    result = await download_video_primary_api(link)
-    if result:
-        print("✅ Video: Primary API Success")
-        return result
+    """Download video using yt-dlp"""
+    video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
+    DOWNLOAD_DIR = "downloads"
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp4")
+
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 10240:
+        LOGGER("ANNIEMUSIC.platforms.Youtube").info("✅ Video cache found")
+        return file_path
+
+    LOGGER("ANNIEMUSIC.platforms.Youtube").info("🎬 Downloading video...")
     
-    # 2. TRY FALLBACK API (TOKEN BASED)
-    print("🔄 Video - Primary failed, trying Fallback API (Token)...")
-    result = await download_video_fallback_api(link)
-    if result:
-        print("✅ Video: Fallback API Success")
-        return result
-    
-    # 3. TRY YT-DLP AS LAST RESORT
-    print("🔄 Video - Both APIs failed, trying yt-dlp fallback...")
     result = await download_video_ytdlp(link)
     if result:
-        print("✅ Video: yt-dlp Success")
+        LOGGER("ANNIEMUSIC.platforms.Youtube").info("✅ Video: yt-dlp Success")
         return result
     
-    print("❌ All video download methods failed")
+    LOGGER("ANNIEMUSIC.platforms.Youtube").error("❌ All video download methods failed")
     return None
-
 
 # ============ YOUTUBE API CLASS ============
 @capture_internal_err
@@ -839,14 +596,14 @@ class YouTubeAPI:
         common_file_path = os.path.join("downloads", f"{video_id}{extension}")
         
         if os.path.exists(common_file_path) and os.path.getsize(common_file_path) > 10240:
-            print("✅ Local cache")
+            LOGGER("ANNIEMUSIC.platforms.Youtube").info("✅ Local cache")
             return common_file_path, True
 
         if songvideo or video:
             try:
                 downloaded_file = await download_video(link)
                 if downloaded_file:
-                    print("✅ Video downloaded successfully")
+                    LOGGER("ANNIEMUSIC.platforms.Youtube").info("✅ Video downloaded successfully")
                     if downloaded_file != common_file_path and downloaded_file.endswith('.mp4'):
                         try:
                             shutil.move(downloaded_file, common_file_path)
@@ -855,11 +612,11 @@ class YouTubeAPI:
                             return downloaded_file, True
                     return downloaded_file, True
             except Exception as e:
-                print(f"❌ Video download error: {str(e)}")
+                LOGGER("ANNIEMUSIC.platforms.Youtube").error(f"❌ Video download error: {str(e)}")
             
             status, stream_url = await self.video(link)
             if status == 1:
-                print("✅ Video stream")
+                LOGGER("ANNIEMUSIC.platforms.Youtube").info("✅ Video stream")
                 return stream_url, None
             else:
                 return None, None
@@ -868,7 +625,7 @@ class YouTubeAPI:
             try:
                 audio_result = await download_audio(link)
                 if audio_result:
-                    print("✅ Audio downloaded successfully")
+                    LOGGER("ANNIEMUSIC.platforms.Youtube").info("✅ Audio downloaded successfully")
                     if audio_result.endswith('.mp3') and common_file_path.endswith('.webm'):
                         mp3_path = audio_result
                         webm_path = common_file_path
@@ -879,12 +636,12 @@ class YouTubeAPI:
                             return audio_result, True
                     return audio_result, True
             except Exception as e:
-                print(f"❌ Audio download error: {str(e)}")
+                LOGGER("ANNIEMUSIC.platforms.Youtube").error(f"❌ Audio download error: {str(e)}")
             
             try:
                 p = await yt_dlp_download(link, type="audio")
                 if p and os.path.exists(p) and os.path.getsize(p) > 10240:
-                    print("✅ yt-dlp (original)")
+                    LOGGER("ANNIEMUSIC.platforms.Youtube").info("✅ yt-dlp (original)")
                     if p != common_file_path:
                         try:
                             shutil.move(p, common_file_path)
@@ -893,12 +650,12 @@ class YouTubeAPI:
                             return p, True
                     return p, True
             except Exception as e:
-                print(f"❌ Original yt-dlp error: {str(e)}")
+                LOGGER("ANNIEMUSIC.platforms.Youtube").error(f"❌ Original yt-dlp error: {str(e)}")
             
             try:
                 p = await download_audio_concurrent(link)
                 if p and os.path.exists(p) and os.path.getsize(p) > 10240:
-                    print("✅ concurrent")
+                    LOGGER("ANNIEMUSIC.platforms.Youtube").info("✅ concurrent")
                     if p != common_file_path:
                         try:
                             shutil.move(p, common_file_path)
@@ -907,9 +664,9 @@ class YouTubeAPI:
                             return p, True
                     return p, True
             except Exception as e:
-                print(f"❌ Concurrent download error: {str(e)}")
+                LOGGER("ANNIEMUSIC.platforms.Youtube").error(f"❌ Concurrent download error: {str(e)}")
             
-            print("❌ All audio download methods failed")
+            LOGGER("ANNIEMUSIC.platforms.Youtube").error("❌ All audio download methods failed")
             return None, None
 
 YouTube = YouTubeAPI()
